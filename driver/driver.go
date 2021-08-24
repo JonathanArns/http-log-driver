@@ -5,18 +5,18 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"log"
 	"path"
 	"sync"
 	"syscall"
 
-	"github.com/sirupsen/logrus"
-    "github.com/snowzach/rotatefilehook"
+	"github.com/containerd/fifo"
 	"github.com/docker/docker/api/types/plugins/logdriver"
 	"github.com/docker/docker/daemon/logger"
 	"github.com/docker/docker/daemon/logger/loggerutils"
 	protoio "github.com/gogo/protobuf/io"
 	"github.com/pkg/errors"
-	"github.com/tonistiigi/fifo"
+	"github.com/sirupsen/logrus"
 )
 
 type Driver struct {
@@ -25,12 +25,12 @@ type Driver struct {
 }
 
 type logPair struct {
-	active  bool
-	file    string
-	info    logger.Info
-	logLine jsonLogLine
-	stream  io.ReadCloser
-    logger  *logrus.Logger
+	active   bool
+	file     string
+	info     logger.Info
+	logLine  jsonLogLine
+	stream   io.ReadCloser
+	endpoint string
 }
 
 func NewDriver() *Driver {
@@ -58,30 +58,24 @@ func (d *Driver) StartLogging(file string, logCtx logger.Info) error {
 		return err
 	}
 
-	extra, err := logCtx.ExtraAttributes(nil)
-	if err != nil {
-		return err
-	}
-
 	hostname, err := logCtx.Hostname()
 	if err != nil {
 		return err
 	}
 
 	logLine := jsonLogLine{
-		ContainerId:      logCtx.FullID(),
-		ContainerName:    logCtx.Name(),
-		ContainerCreated: jsonTime{logCtx.ContainerCreated},
-		ImageId:          logCtx.ImageFullID(),
-		ImageName:        logCtx.ImageName(),
-		Command:          logCtx.Command(),
-		Tag:              tag,
-		Extra:            extra,
-		Host:             hostname,
+		ContainerId:   logCtx.FullID(),
+		ContainerName: logCtx.Name(),
+		Tag:           tag,
+		Host:          hostname,
 	}
 
-    logger := buildLogger(&logCtx)
-	lp := &logPair{true, file, logCtx, logLine, stream, logger}
+	endpoint, ok := logCtx.Config["endpoint"]
+	if !ok {
+		return errors.New("enpoint parameter is required")
+	}
+
+	lp := &logPair{true, file, logCtx, logLine, stream, endpoint}
 
 	d.mu.Lock()
 	d.logs[path.Base(file)] = lp
@@ -92,14 +86,11 @@ func (d *Driver) StartLogging(file string, logCtx logger.Info) error {
 }
 
 func (d *Driver) StopLogging(file string) error {
-	logrus.WithField("file", file).Info("Stop logging")
 	d.mu.Lock()
 	lp, ok := d.logs[path.Base(file)]
 	if ok {
 		lp.active = false
 		delete(d.logs, path.Base(file))
-	} else {
-		logrus.WithField("file", file).Errorf("Failed to stop logging. File %q is not active", file)
 	}
 	d.mu.Unlock()
 	return nil
@@ -122,17 +113,14 @@ func consumeLog(lp *logPair) {
 
 	for {
 		if !lp.active {
-			logrus.WithField("id", lp.info.ContainerID).Debug("shutting down logger goroutine due to stop request")
 			return
 		}
 
 		err := dec.ReadMsg(&buf)
 		if err != nil {
 			if err == io.EOF {
-				logrus.WithField("id", lp.info.ContainerID).WithError(err).Debug("shutting down logger goroutine due to file EOF")
 				return
 			} else {
-				logrus.WithField("id", lp.info.ContainerID).WithError(err).Warn("error reading from FIFO, trying to continue")
 				dec = protoio.NewUint32DelimitedReader(lp.stream, binary.BigEndian, 1e6)
 				continue
 			}
@@ -140,37 +128,9 @@ func consumeLog(lp *logPair) {
 
 		err = logMessage(lp, buf.Line)
 		if err != nil {
-			logrus.WithField("id", lp.info.ContainerID).WithError(err).Warn("error logging message, dropping it and continuing")
+			log.Println("error logging message, dropping it and continuing: " + err.Error())
 		}
 
 		buf.Reset()
 	}
-}
-
-func buildLogger(logCtx *logger.Info) *logrus.Logger {
-    P := parseInt
-
-    fpath := parseFpath(readWithDefault(logCtx.Config, "fpath", ""), "/var/log/docker/docker_file_log_driver_default.log")
-    max_size := P(readWithDefault(logCtx.Config, "max-size", ""), 10)
-    max_backups := P(readWithDefault(logCtx.Config, "max-backups", ""), 10)
-    max_age := P(readWithDefault(logCtx.Config, "max-age", ""), 100)
-
-    hook, err := rotatefilehook.NewRotateFileHook(rotatefilehook.RotateFileConfig{
-        Filename: fpath,
-        MaxSize: max_size,
-        MaxBackups: max_backups,
-        MaxAge: max_age,
-        Level: logrus.DebugLevel,
-        Formatter: new(logrus.JSONFormatter),
-    })
-
-    if err != nil {
-        // FIXME: ?
-        panic(err);
-    }
-
-    logger := logrus.New()
-    logger.AddHook(hook)
-
-	return logger
 }

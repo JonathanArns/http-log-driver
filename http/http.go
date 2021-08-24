@@ -4,9 +4,9 @@ import (
 	"encoding/json"
 	"net/http"
 
+	"github.com/JonathanArns/http-log-driver/driver"
 	"github.com/docker/docker/daemon/logger"
 	"github.com/docker/go-plugins-helpers/sdk"
-	"github.com/deep-compute/docker-file-log-driver/driver"
 )
 
 type startLoggingRequest struct {
